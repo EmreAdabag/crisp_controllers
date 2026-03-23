@@ -1,6 +1,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <std_msgs/msg/string.hpp>
 
 #include <Eigen/src/Core/Matrix.h>  // NOLINT(build/include_order)
 #include <fmt/format.h>
@@ -186,7 +187,7 @@ CartesianController::update(const rclcpp::Time & time, const rclcpp::Duration & 
   if (params_.limit_torques) {
     tau_d = saturateTorqueRate(tau_d, tau_previous, params_.max_delta_tau);
   }
-  tau_d = exponential_moving_average(tau_d, tau_previous, params_.filter.output_torque);
+  tau_d = exponential_moving_average(tau_previous, tau_d, params_.filter.output_torque);
 
   if (!params_.stop_commands) {
     for (size_t i = 0; i < params_.joints.size(); ++i) {
@@ -219,19 +220,31 @@ CallbackReturn CartesianController::on_init() {
 
 CallbackReturn
 CartesianController::on_configure(const rclcpp_lifecycle::State & /*previous_state*/) {
-  auto parameters_client =
-    std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "robot_state_publisher");
-  parameters_client->wait_for_service();
-
-  auto future = parameters_client->get_parameters({"robot_description"});
-  auto result = future.get();
-
+  // Subscribe to /robot_description topic (transient_local) to get the URDF.
+  // Uses a temporary node with its own executor to avoid deadlocking the
+  // controller_manager's executor (needed for gazebo_ros2_control).
   std::string robot_description_;
-  if (!result.empty()) {
-    robot_description_ = result[0].value_to_string();
-  } else {
-    RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter.");
-    return CallbackReturn::ERROR;
+  {
+    auto temp_node = rclcpp::Node::make_shared(
+      "_urdf_reader_" + std::string(get_node()->get_name()));
+    bool received = false;
+    auto sub = temp_node->create_subscription<std_msgs::msg::String>(
+      "/robot_description", rclcpp::QoS(1).transient_local(),
+      [&robot_description_, &received](const std_msgs::msg::String::SharedPtr msg) {
+        robot_description_ = msg->data;
+        received = true;
+      });
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(temp_node);
+    auto start = std::chrono::steady_clock::now();
+    while (!received && rclcpp::ok() &&
+           (std::chrono::steady_clock::now() - start) < std::chrono::seconds(30)) {
+      executor.spin_some(std::chrono::milliseconds(100));
+    }
+    if (!received) {
+      RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description from topic.");
+      return CallbackReturn::ERROR;
+    }
   }
 
   pinocchio::Model raw_model_;
@@ -432,18 +445,21 @@ CartesianController::on_configure(const rclcpp_lifecycle::State & /*previous_sta
 
 void CartesianController::setStiffnessAndDamping() {
   stiffness.setZero();
-  stiffness.diagonal() << params_.task.k_pos_x, params_.task.k_pos_y, params_.task.k_pos_z,
+  Eigen::VectorXd stiffness_diag(6);
+  stiffness_diag << params_.task.k_pos_x, params_.task.k_pos_y, params_.task.k_pos_z,
     params_.task.k_rot_x, params_.task.k_rot_y, params_.task.k_rot_z;
+  stiffness.diagonal() = stiffness_diag;
 
   damping.setZero();
-  // For each axis, use explicit damping if > 0, otherwise compute from stiffness
-  damping.diagonal()
-    << (params_.task.d_pos_x > 0 ? params_.task.d_pos_x : 2.0 * std::sqrt(params_.task.k_pos_x)),
+  Eigen::VectorXd damping_diag(6);
+  damping_diag <<
+    (params_.task.d_pos_x > 0 ? params_.task.d_pos_x : 2.0 * std::sqrt(params_.task.k_pos_x)),
     (params_.task.d_pos_y > 0 ? params_.task.d_pos_y : 2.0 * std::sqrt(params_.task.k_pos_y)),
     (params_.task.d_pos_z > 0 ? params_.task.d_pos_z : 2.0 * std::sqrt(params_.task.k_pos_z)),
     (params_.task.d_rot_x > 0 ? params_.task.d_rot_x : 2.0 * std::sqrt(params_.task.k_rot_x)),
     (params_.task.d_rot_y > 0 ? params_.task.d_rot_y : 2.0 * std::sqrt(params_.task.k_rot_y)),
     (params_.task.d_rot_z > 0 ? params_.task.d_rot_z : 2.0 * std::sqrt(params_.task.k_rot_z));
+  damping.diagonal() = damping_diag;
 
   nullspace_stiffness.setZero();
   nullspace_damping.setZero();
@@ -452,10 +468,9 @@ void CartesianController::setStiffnessAndDamping() {
   for (size_t i = 0; i < params_.joints.size(); ++i) {
     weights[i] = params_.nullspace.weights.joints_map.at(params_.joints.at(i)).value;
   }
-  nullspace_stiffness.diagonal() << params_.nullspace.stiffness * weights;
-  nullspace_damping.diagonal() << 2.0 * nullspace_stiffness.diagonal().cwiseSqrt();
+  nullspace_stiffness.diagonal() = params_.nullspace.stiffness * weights;
 
-  if (params_.nullspace.damping) {
+  if (params_.nullspace.damping > 0) {
     nullspace_damping.diagonal() = params_.nullspace.damping * weights;
   } else {
     nullspace_damping.diagonal() = 2.0 * nullspace_stiffness.diagonal().cwiseSqrt();
@@ -518,12 +533,41 @@ CartesianController::on_activate(const rclcpp_lifecycle::State & /*previous_stat
   desired_position_ = target_position_;
   desired_orientation_ = target_orientation_;
 
+  // Initialize tau_previous with gravity (and optionally coriolis) compensation
+  // torques so that the first update cycle doesn't start from zero. Starting from
+  // zero causes the rate limiter and EMA filter to suppress the actual torques for
+  // many cycles, preventing motion on real hardware.
+  if (params_.use_gravity_compensation) {
+    tau_previous = pinocchio::computeGeneralizedGravity(model_, data_, q_pin);
+    if (params_.use_coriolis_compensation) {
+      pinocchio::computeAllTerms(model_, data_, q_pin, dq);
+      tau_previous += pinocchio::computeCoriolisMatrix(model_, data_, q_pin, dq) * dq;
+    }
+  } else {
+    tau_previous = Eigen::VectorXd::Zero(model_.nv);
+  }
+
   RCLCPP_INFO(get_node()->get_logger(), "Controller activated.");
   return CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn
 CartesianController::on_deactivate(const rclcpp_lifecycle::State & /*previous_state*/) {
+  // Zero out the effort command interfaces so that any keepalive frames sent
+  // by the hardware interface during the controller switch period carry zero
+  // torque rather than the last computed control torques.  Without this, the
+  // arm experiences a jolt when the hardware layer abruptly stops forwarding
+  // effort commands and switches actuators back to position mode.
+  for (size_t i = 0; i < command_interfaces_.size(); ++i) {
+#if ROS2_VERSION_ABOVE_HUMBLE
+    (void)command_interfaces_[i].set_value(0.0);
+#else
+    command_interfaces_[i].set_value(0.0);
+#endif
+  }
+  tau_previous = Eigen::VectorXd::Zero(model_.nv);
+
+  RCLCPP_INFO(get_node()->get_logger(), "Controller deactivated — effort commands zeroed.");
   return CallbackReturn::SUCCESS;
 }
 
@@ -665,6 +709,16 @@ void CartesianController::log_debug_info(const rclcpp::Time & time) {
       *get_node()->get_clock(),
       1000,
       "tau_coriolis: " << tau_coriolis.transpose());
+    RCLCPP_INFO_STREAM_THROTTLE(
+      get_node()->get_logger(),
+      *get_node()->get_clock(),
+      1000,
+      "tau_gravity: " << tau_gravity.transpose());
+    RCLCPP_INFO_STREAM_THROTTLE(
+      get_node()->get_logger(),
+      *get_node()->get_clock(),
+      1000,
+      "tau_d (total): " << tau_d.transpose());
   }
 
   if (params_.log.dynamic_params) {

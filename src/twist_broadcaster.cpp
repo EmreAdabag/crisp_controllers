@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cmath>
 #include <memory>
+#include <std_msgs/msg/string.hpp>
 
 #include <Eigen/src/Core/Matrix.h>  // NOLINT(build/include_order)
 #include <crisp_controllers/twist_broadcaster.hpp>
@@ -113,19 +114,31 @@ CallbackReturn TwistBroadcaster::on_init() {
 }
 
 CallbackReturn TwistBroadcaster::on_configure(const rclcpp_lifecycle::State & /*previous_state*/) {
-  auto parameters_client =
-    std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "robot_state_publisher");
-  parameters_client->wait_for_service();
-
-  auto future = parameters_client->get_parameters({"robot_description"});
-  auto result = future.get();
-
+  // Subscribe to /robot_description topic (transient_local) to get the URDF.
+  // Uses a temporary node with its own executor to avoid deadlocking the
+  // controller_manager's executor (needed for gazebo_ros2_control).
   std::string robot_description_;
-  if (!result.empty()) {
-    robot_description_ = result[0].value_to_string();
-  } else {
-    RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter.");
-    return CallbackReturn::ERROR;
+  {
+    auto temp_node = rclcpp::Node::make_shared(
+      "_urdf_reader_" + std::string(get_node()->get_name()));
+    bool received = false;
+    auto sub = temp_node->create_subscription<std_msgs::msg::String>(
+      "/robot_description", rclcpp::QoS(1).transient_local(),
+      [&robot_description_, &received](const std_msgs::msg::String::SharedPtr msg) {
+        robot_description_ = msg->data;
+        received = true;
+      });
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(temp_node);
+    auto start = std::chrono::steady_clock::now();
+    while (!received && rclcpp::ok() &&
+           (std::chrono::steady_clock::now() - start) < std::chrono::seconds(30)) {
+      executor.spin_some(std::chrono::milliseconds(100));
+    }
+    if (!received) {
+      RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description from topic.");
+      return CallbackReturn::ERROR;
+    }
   }
 
   pinocchio::Model raw_model_;
